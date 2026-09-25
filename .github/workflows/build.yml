@@ -26,7 +26,7 @@ jobs:
 
       - name: Compile Standalone Windows EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name "HandwritingKeyboard" app.py
+          pyinstaller --noconfirm --onefile --windowed --collect-all PyQt6 --name "HandwritingKeyboard" app.py
 
       - name: Upload Keyboard Executable
         uses: actions/upload-artifact@v4
