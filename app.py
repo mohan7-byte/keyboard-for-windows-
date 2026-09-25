@@ -1,80 +1,109 @@
 import sys
 import time
 import json
-import urllib.request
 import traceback
 import ctypes
 from ctypes import wintypes
+import requests
 
-# Display native Windows error popup if any unhandled error occurs
-def global_exception_handler(exctype, value, tb):
-    err_text = "".join(traceback.format_exception(exctype, value, tb))
-    ctypes.windll.user32.MessageBoxW(0, f"Error starting app:\n\n{err_text}", "Keyboard Error", 0x10)
-    sys.exit(1)
-
-sys.excepthook = global_exception_handler
-
-import pyperclip
 from PyQt6.QtCore import Qt, QPoint, QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QPainter, QPen, QColor, QFont
+from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QIcon, QPixmap, QAction
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSizeGrip, QCheckBox
+    QPushButton, QLabel, QCheckBox, QSystemTrayIcon, QMenu
 )
 
+# ----------------- Native Windows SendInput (Direct Unicode) -----------------
 user32 = ctypes.windll.user32
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+VK_BACK = 0x08
+VK_RETURN = 0x0D
+VK_SPACE = 0x20
 
 GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOPMOST = 0x00000008
 
-VK_BACK = 0x08
-VK_RETURN = 0x0D
-VK_SPACE = 0x20
-VK_CONTROL = 0x11
-KEYEVENTF_KEYUP = 0x0002
+ULONG_PTR = ctypes.c_size_t
 
-def send_key(vk):
-    user32.keybd_event(vk, 0, 0, 0)
-    time.sleep(0.005)
-    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-    time.sleep(0.005)
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", _INPUT_UNION),
+    ]
+
+def send_unicode_char(ch):
+    code = ord(ch)
+    inp_down = INPUT(type=INPUT_KEYBOARD)
+    inp_down.union.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE, time=0, dwExtraInfo=0)
+
+    inp_up = INPUT(type=INPUT_KEYBOARD)
+    inp_up.union.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time=0, dwExtraInfo=0)
+
+    arr = (INPUT * 2)(inp_down, inp_up)
+    user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+
+def type_text(text):
+    """Types Unicode directly into active apps (Chrome/Word/Notepad) without touching clipboard."""
+    for ch in text:
+        send_unicode_char(ch)
+        time.sleep(0.001)
+
+def send_vk_key(vk_code):
+    inp_down = INPUT(type=INPUT_KEYBOARD)
+    inp_down.union.ki = KEYBDINPUT(wVk=vk_code, wScan=0, dwFlags=0, time=0, dwExtraInfo=0)
+
+    inp_up = INPUT(type=INPUT_KEYBOARD)
+    inp_up.union.ki = KEYBDINPUT(wVk=vk_code, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=0)
+
+    arr = (INPUT * 2)(inp_down, inp_up)
+    user32.SendInput(2, arr, ctypes.sizeof(INPUT))
 
 def press_backspace(count=1):
     for _ in range(count):
-        send_key(VK_BACK)
-
-def type_text(text):
-    """
-    Pastes text via clipboard for 100% accurate Hindi conjuncts (matras & ligatures)
-    without corrupting active input focus.
-    """
-    old_clipboard = ""
-    try:
-        old_clipboard = pyperclip.paste()
-    except Exception:
-        pass
-
-    pyperclip.copy(text)
-    time.sleep(0.01)
-
-    # Simulate Ctrl + V
-    user32.keybd_event(VK_CONTROL, 0, 0, 0)
-    user32.keybd_event(ord('V'), 0, 0, 0)
-    time.sleep(0.01)
-    user32.keybd_event(ord('V'), 0, KEYEVENTF_KEYUP, 0)
-    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-    time.sleep(0.02)
-
-    # Restore prior clipboard data
-    try:
-        if old_clipboard:
-            pyperclip.copy(old_clipboard)
-    except Exception:
-        pass
+        send_vk_key(VK_BACK)
+        time.sleep(0.002)
 
 
-# ----------------- Handwriting Worker Thread -----------------
+# ----------------- Persistent Fast HTTP Session -----------------
+http_session = requests.Session()
+
 class RecognitionWorker(QThread):
     finished = pyqtSignal(list)
     failed = pyqtSignal(str)
@@ -100,18 +129,17 @@ class RecognitionWorker(QThread):
         }
 
         try:
-            req = urllib.request.Request(
+            resp = http_session.post(
                 "https://inputtools.google.com/request?ime=handwriting&app=mobilesearch&cs=1&oe=UTF-8",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
+                json=payload,
+                timeout=4
             )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                if result and result[0] == "SUCCESS" and len(result) > 1 and len(result[1]) > 0:
-                    candidates = result[1][0][1]
-                    self.finished.emit(candidates)
-                else:
-                    self.failed.emit("No match")
+            result = resp.json()
+            if result and result[0] == "SUCCESS" and len(result) > 1 and len(result[1]) > 0:
+                candidates = result[1][0][1]
+                self.finished.emit(candidates)
+            else:
+                self.failed.emit("No match")
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -129,9 +157,10 @@ class InkPad(QWidget):
 
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
+        # Reduced from 600ms to 350ms for near-instant recognition upon pen lift
         self.idle_timer = QTimer(self)
         self.idle_timer.setSingleShot(True)
-        self.idle_timer.setInterval(600)  # 600ms after lifting pen
+        self.idle_timer.setInterval(350)
         self.idle_timer.timeout.connect(self._on_idle_timeout)
 
         self.setStyleSheet("background-color: #0f172a; border-radius: 8px;")
@@ -200,7 +229,48 @@ class InkPad(QWidget):
                 painter.drawLine(int(xs[i - 1]), int(ys[i - 1]), int(xs[i]), int(ys[i]))
 
 
-# ----------------- Floating Window -----------------
+# ----------------- Visual Resize Corner Handle -----------------
+class ResizeCornerGrip(QWidget):
+    """An explicit, visible bottom-right resize handle that scales the window on drag."""
+    def __init__(self, target_window):
+        super().__init__(target_window)
+        self.target = target_window
+        self.setFixedSize(22, 22)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.drag_start = None
+        self.start_size = None
+        self.setToolTip("Drag to resize")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start = event.globalPosition().toPoint()
+            self.start_size = self.target.size()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_start:
+            delta = event.globalPosition().toPoint() - self.drag_start
+            new_w = max(380, self.start_size.width() + delta.x())
+            new_h = max(200, self.start_size.height() + delta.y())
+            self.target.resize(new_w, new_h)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self.drag_start = None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#64748b"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        # Draw 3 diagonal grip stripes
+        w, h = self.width(), self.height()
+        painter.drawLine(w - 4, h - 12, w - 12, h - 4)
+        painter.drawLine(w - 4, h - 8,  w - 8,  h - 4)
+        painter.drawLine(w - 4, h - 4,  w - 4,  h - 4)
+
+
+# ----------------- Main Floating Keyboard Window -----------------
 class FloatingHandwritingKeyboard(QWidget):
     def __init__(self):
         super().__init__()
@@ -208,9 +278,14 @@ class FloatingHandwritingKeyboard(QWidget):
         self.last_typed_text = ""
         self.drag_position = QPoint()
 
-        # Window Flags: Tool window that refuses keyboard focus
+        self.init_window_flags()
+        self.init_ui()
+        self.init_tray_icon()
+
+    def init_window_flags(self):
+        # Using Window (not Tool) so it has a Taskbar icon and can minimize cleanly
         self.setWindowFlags(
-            Qt.WindowType.Tool |
+            Qt.WindowType.Window |
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.WindowDoesNotAcceptFocus
@@ -219,14 +294,13 @@ class FloatingHandwritingKeyboard(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        self.setMinimumSize(420, 240)
-        self.resize(540, 310)
-
-        self.init_ui()
+        self.setMinimumSize(380, 200)
+        self.resize(520, 280)
+        self.setWindowTitle("Ink Keyboard")
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Windows-specific style to prevent activating or stealing cursor focus
+        # Apply Windows Non-Activating extended style so user clicks don't steal cursor
         try:
             hwnd = int(self.winId())
             GetWindowLong = getattr(user32, 'GetWindowLongPtrW', user32.GetWindowLongW)
@@ -238,7 +312,7 @@ class FloatingHandwritingKeyboard(QWidget):
 
     def init_ui(self):
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setContentsMargins(6, 6, 6, 6)
 
         self.container = QWidget(self)
         self.container.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -246,15 +320,15 @@ class FloatingHandwritingKeyboard(QWidget):
             QWidget {
                 background-color: #1e293b;
                 border: 1px solid #334155;
-                border-radius: 14px;
+                border-radius: 12px;
                 color: #f8fafc;
             }
         """)
         container_layout = QVBoxLayout(self.container)
-        container_layout.setContentsMargins(10, 8, 10, 8)
+        container_layout.setContentsMargins(8, 6, 8, 6)
         container_layout.setSpacing(6)
 
-        # Top Bar
+        # Top Control / Title Bar
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(2, 0, 2, 0)
 
@@ -300,6 +374,17 @@ class FloatingHandwritingKeyboard(QWidget):
         self.enter_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.enter_btn.setStyleSheet(btn_style)
 
+        # Minimize Button (sends to taskbar & tray)
+        self.min_btn = QPushButton("—", self)
+        self.min_btn.setFixedSize(22, 22)
+        self.min_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.min_btn.setStyleSheet("""
+            QPushButton { background: #475569; color: white; border-radius: 11px; border: none; font-weight: bold; font-size: 10px; }
+            QPushButton:hover { background: #64748b; }
+        """)
+        self.min_btn.clicked.connect(self.showMinimized)
+
+        # Close Button
         self.close_btn = QPushButton("✕", self)
         self.close_btn.setFixedSize(22, 22)
         self.close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -307,7 +392,7 @@ class FloatingHandwritingKeyboard(QWidget):
             QPushButton { background: #ef4444; color: white; border-radius: 11px; border: none; font-weight: bold; font-size: 11px; }
             QPushButton:hover { background: #dc2626; }
         """)
-        self.close_btn.clicked.connect(self.close)
+        self.close_btn.clicked.connect(self.hide)
 
         top_bar.addWidget(self.title_lbl)
         top_bar.addWidget(self.lang_btn)
@@ -318,35 +403,72 @@ class FloatingHandwritingKeyboard(QWidget):
         top_bar.addWidget(self.bksp_btn)
         top_bar.addWidget(self.space_btn)
         top_bar.addWidget(self.enter_btn)
+        top_bar.addWidget(self.min_btn)
         top_bar.addWidget(self.close_btn)
         container_layout.addLayout(top_bar)
 
-        # Drawing Canvas
+        # Ink Drawing Surface
         self.canvas = InkPad(self)
         self.canvas.stroke_finished.connect(self.recognize_strokes)
         container_layout.addWidget(self.canvas, 1)
 
-        # Bottom Bar: Candidate Chips + Resize Grip
+        # Bottom Bar: Candidate Chips + Visible Resize Grip
         bottom_bar = QHBoxLayout()
-        bottom_bar.setContentsMargins(2, 2, 0, 2)
+        bottom_bar.setContentsMargins(2, 0, 0, 0)
 
         self.cand_container = QHBoxLayout()
         self.cand_container.setSpacing(6)
         bottom_bar.addLayout(self.cand_container, 1)
 
-        self.size_grip = QSizeGrip(self)
-        self.size_grip.setStyleSheet("background: transparent; border: none;")
-        bottom_bar.addWidget(self.size_grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+        # Visible, drag-enabled corner grip
+        self.resize_grip = ResizeCornerGrip(self)
+        bottom_bar.addWidget(self.resize_grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
 
         container_layout.addLayout(bottom_bar)
         root_layout.addWidget(self.container)
 
-        # Actions
+        # Connections
         self.undo_btn.clicked.connect(self.canvas.undo)
         self.clear_btn.clicked.connect(self.clear_all)
         self.bksp_btn.clicked.connect(lambda: press_backspace(1))
-        self.space_btn.clicked.connect(lambda: send_key(VK_SPACE))
-        self.enter_btn.clicked.connect(lambda: send_key(VK_RETURN))
+        self.space_btn.clicked.connect(lambda: send_vk_key(VK_SPACE))
+        self.enter_btn.clicked.connect(lambda: send_vk_key(VK_RETURN))
+
+    def init_tray_icon(self):
+        """Creates a System Tray icon near the Windows clock so the pad is always accessible."""
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(QColor("#38bdf8"))
+        self.tray_icon = QSystemTrayIcon(QIcon(pixmap), self)
+        self.tray_icon.setToolTip("Handwriting Keyboard")
+
+        tray_menu = QMenu()
+        show_action = QAction("Show / Restore Keyboard", self)
+        show_action.triggered.connect(self.restore_window)
+        tray_menu.addAction(show_action)
+
+        toggle_lang_action = QAction("Toggle Language (Hindi / English)", self)
+        toggle_lang_action.triggered.connect(self.toggle_language)
+        tray_menu.addAction(toggle_lang_action)
+
+        tray_menu.addSeparator()
+        quit_action = QAction("Quit Completely", self)
+        quit_action.triggered.connect(QApplication.instance().quit)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def restore_window(self):
+        self.showNormal()
+        self.activateWindow()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self.restore_window()
 
     def toggle_language(self):
         if self.current_lang == "hi":
@@ -364,7 +486,6 @@ class FloatingHandwritingKeyboard(QWidget):
         self.worker.start()
 
     def on_recognized(self, candidates):
-        # Clear previous chips
         while self.cand_container.count():
             item = self.cand_container.takeAt(0)
             if item.widget():
@@ -375,13 +496,11 @@ class FloatingHandwritingKeyboard(QWidget):
 
         top_word = candidates[0]
 
-        # Auto-type if checked
         if self.auto_type_cb.isChecked():
             type_text(top_word + " ")
             self.last_typed_text = top_word + " "
             self.canvas.clear()
 
-        # Build candidate chips
         for word in candidates[:6]:
             chip = QPushButton(word, self)
             chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -409,7 +528,7 @@ class FloatingHandwritingKeyboard(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-    # Move window by dragging the container
+    # Drag window by title bar / frame
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
