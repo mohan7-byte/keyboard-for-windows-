@@ -1,1 +1,35 @@
+name: Build Handwriting Keyboard EXE
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Standalone Windows EXE
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --collect-all PyQt6 --name "HandwritingKeyboard" app.py
+
+      - name: Upload Keyboard Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: HandwritingKeyboard-Windows
+          path: dist/HandwritingKeyboard.exe
