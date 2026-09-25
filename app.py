@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QCheckBox, QSystemTrayIcon, QMenu
 )
 
-# ----------------- Native Windows SendInput (Direct Unicode) -----------------
+# ----------------- Native Windows Win32 APIs -----------------
 user32 = ctypes.windll.user32
 
 INPUT_KEYBOARD = 1
@@ -68,6 +68,19 @@ class INPUT(ctypes.Structure):
         ("union", _INPUT_UNION),
     ]
 
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
 def send_unicode_char(ch):
     code = ord(ch)
     inp_down = INPUT(type=INPUT_KEYBOARD)
@@ -80,7 +93,7 @@ def send_unicode_char(ch):
     user32.SendInput(2, arr, ctypes.sizeof(INPUT))
 
 def type_text(text):
-    """Types Unicode directly into active apps (Chrome/Word/Notepad) without touching clipboard."""
+    """Types directly into Chrome/Word/Notepad without using clipboard."""
     for ch in text:
         send_unicode_char(ch)
         time.sleep(0.001)
@@ -101,7 +114,7 @@ def press_backspace(count=1):
         time.sleep(0.002)
 
 
-# ----------------- Persistent Fast HTTP Session -----------------
+# ----------------- Fast HTTP Session -----------------
 http_session = requests.Session()
 
 class RecognitionWorker(QThread):
@@ -157,10 +170,9 @@ class InkPad(QWidget):
 
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        # Reduced from 600ms to 350ms for near-instant recognition upon pen lift
         self.idle_timer = QTimer(self)
         self.idle_timer.setSingleShot(True)
-        self.idle_timer.setInterval(350)
+        self.idle_timer.setInterval(350)  # Ultra-fast 350ms trigger upon pen lift
         self.idle_timer.timeout.connect(self._on_idle_timeout)
 
         self.setStyleSheet("background-color: #0f172a; border-radius: 8px;")
@@ -231,7 +243,6 @@ class InkPad(QWidget):
 
 # ----------------- Visual Resize Corner Handle -----------------
 class ResizeCornerGrip(QWidget):
-    """An explicit, visible bottom-right resize handle that scales the window on drag."""
     def __init__(self, target_window):
         super().__init__(target_window)
         self.target = target_window
@@ -263,11 +274,80 @@ class ResizeCornerGrip(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = QPen(QColor("#64748b"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
-        # Draw 3 diagonal grip stripes
         w, h = self.width(), self.height()
         painter.drawLine(w - 4, h - 12, w - 12, h - 4)
         painter.drawLine(w - 4, h - 8,  w - 8,  h - 4)
         painter.drawLine(w - 4, h - 4,  w - 4,  h - 4)
+
+
+# ----------------- Floating Stylus Bubble Widget -----------------
+class FloatingStylusBubble(QWidget):
+    """A floating mini-bubble that docks at the edge when the keyboard is collapsed."""
+    clicked = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.drag_pos = None
+        self.moved = False
+
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self.setFixedSize(50, 50)
+        self.setToolTip("Tap to open Handwriting Pad")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            hwnd = int(self.winId())
+            GetWindowLong = getattr(user32, 'GetWindowLongPtrW', user32.GetWindowLongW)
+            SetWindowLong = getattr(user32, 'SetWindowLongPtrW', user32.SetWindowLongW)
+            style = GetWindowLong(hwnd, GWL_EXSTYLE)
+            SetWindowLong(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOPMOST)
+        except Exception:
+            pass
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.moved = False
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton and self.drag_pos:
+            self.move(event.globalPosition().toPoint() - self.drag_pos)
+            self.moved = True
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if not self.moved:
+                self.clicked.emit()
+            self.drag_pos = None
+            event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Draw floating glowing pill
+        painter.setBrush(QColor("#1e293b"))
+        pen = QPen(QColor("#38bdf8"), 2)
+        painter.setPen(pen)
+        painter.drawEllipse(3, 3, 44, 44)
+
+        # Draw icon
+        painter.setPen(QColor("#ffffff"))
+        font = QFont("Segoe UI", 16)
+        painter.setFont(font)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "✍️")
 
 
 # ----------------- Main Floating Keyboard Window -----------------
@@ -282,8 +362,21 @@ class FloatingHandwritingKeyboard(QWidget):
         self.init_ui()
         self.init_tray_icon()
 
+        # Initialize Floating Bubble
+        self.bubble = FloatingStylusBubble()
+        self.bubble.clicked.connect(self.expand_from_bubble)
+        # Position bubble initially at right-middle of screen
+        screen = QApplication.primaryScreen().geometry()
+        self.bubble.move(screen.width() - 70, screen.height() // 2)
+
+        # Background text-field focus monitor (0% CPU polling)
+        self.last_focused_hwnd = None
+        self.focus_timer = QTimer(self)
+        self.focus_timer.setInterval(300)
+        self.focus_timer.timeout.connect(self.check_text_focus)
+        self.focus_timer.start()
+
     def init_window_flags(self):
-        # Using Window (not Tool) so it has a Taskbar icon and can minimize cleanly
         self.setWindowFlags(
             Qt.WindowType.Window |
             Qt.WindowType.FramelessWindowHint |
@@ -295,12 +388,11 @@ class FloatingHandwritingKeyboard(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.setMinimumSize(380, 200)
-        self.resize(520, 280)
+        self.resize(530, 280)
         self.setWindowTitle("Ink Keyboard")
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Apply Windows Non-Activating extended style so user clicks don't steal cursor
         try:
             hwnd = int(self.winId())
             GetWindowLong = getattr(user32, 'GetWindowLongPtrW', user32.GetWindowLongW)
@@ -309,6 +401,37 @@ class FloatingHandwritingKeyboard(QWidget):
             SetWindowLong(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOPMOST)
         except Exception:
             pass
+
+    def check_text_focus(self):
+        """Auto-detects when stylus or cursor enters a text typing field in any app."""
+        if not self.auto_popup_cb.isChecked() or self.isVisible():
+            return
+
+        gui_info = GUITHREADINFO()
+        gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if user32.GetGUIThreadInfo(0, ctypes.byref(gui_info)):
+            hwnd = gui_info.hwndFocus
+            if hwnd and hwnd != int(self.winId()) and hwnd != int(self.bubble.winId()):
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, buf, 256)
+                cls_name = buf.value.lower()
+
+                # Common editable text fields across Windows & Browsers
+                is_text = any(k in cls_name for k in ["edit", "richedit", "document", "content", "input", "render"])
+                if is_text or gui_info.hwndCaret != 0:
+                    if hwnd != self.last_focused_hwnd:
+                        self.last_focused_hwnd = hwnd
+                        self.expand_from_bubble()
+
+    def collapse_to_bubble(self):
+        """Hides the main pad and displays the small floating pen bubble."""
+        self.hide()
+        self.bubble.show()
+
+    def expand_from_bubble(self):
+        """Expands back into the full handwriting pad."""
+        self.bubble.hide()
+        self.show()
 
     def init_ui(self):
         root_layout = QVBoxLayout(self)
@@ -340,6 +463,12 @@ class FloatingHandwritingKeyboard(QWidget):
         self.lang_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.lang_btn.setStyleSheet("background: #3b82f6; color: white; font-weight: 600; border-radius: 6px; border: none; font-size: 11px;")
         self.lang_btn.clicked.connect(self.toggle_language)
+
+        self.auto_popup_cb = QCheckBox("Auto-Popup", self)
+        self.auto_popup_cb.setChecked(True)
+        self.auto_popup_cb.setToolTip("Automatically shows keyboard when touching text boxes")
+        self.auto_popup_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.auto_popup_cb.setStyleSheet("font-size: 11px; color: #94a3b8; border: none;")
 
         self.auto_type_cb = QCheckBox("Auto-Type", self)
         self.auto_type_cb.setChecked(True)
@@ -374,17 +503,17 @@ class FloatingHandwritingKeyboard(QWidget):
         self.enter_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.enter_btn.setStyleSheet(btn_style)
 
-        # Minimize Button (sends to taskbar & tray)
-        self.min_btn = QPushButton("—", self)
-        self.min_btn.setFixedSize(22, 22)
-        self.min_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.min_btn.setStyleSheet("""
-            QPushButton { background: #475569; color: white; border-radius: 11px; border: none; font-weight: bold; font-size: 10px; }
-            QPushButton:hover { background: #64748b; }
+        # Collapse to Stylus Bubble button
+        self.collapse_btn = QPushButton("🫧 Dock", self)
+        self.collapse_btn.setToolTip("Collapse into floating edge bubble")
+        self.collapse_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.collapse_btn.setStyleSheet("""
+            QPushButton { background: #0284c7; color: white; border-radius: 5px; border: none; font-size: 11px; padding: 3px 7px; font-weight: bold; }
+            QPushButton:hover { background: #0369a1; }
         """)
-        self.min_btn.clicked.connect(self.showMinimized)
+        self.collapse_btn.clicked.connect(self.collapse_to_bubble)
 
-        # Close Button
+        # Close / Hide Button
         self.close_btn = QPushButton("✕", self)
         self.close_btn.setFixedSize(22, 22)
         self.close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -392,10 +521,11 @@ class FloatingHandwritingKeyboard(QWidget):
             QPushButton { background: #ef4444; color: white; border-radius: 11px; border: none; font-weight: bold; font-size: 11px; }
             QPushButton:hover { background: #dc2626; }
         """)
-        self.close_btn.clicked.connect(self.hide)
+        self.close_btn.clicked.connect(self.collapse_to_bubble)
 
         top_bar.addWidget(self.title_lbl)
         top_bar.addWidget(self.lang_btn)
+        top_bar.addWidget(self.auto_popup_cb)
         top_bar.addWidget(self.auto_type_cb)
         top_bar.addStretch()
         top_bar.addWidget(self.undo_btn)
@@ -403,7 +533,7 @@ class FloatingHandwritingKeyboard(QWidget):
         top_bar.addWidget(self.bksp_btn)
         top_bar.addWidget(self.space_btn)
         top_bar.addWidget(self.enter_btn)
-        top_bar.addWidget(self.min_btn)
+        top_bar.addWidget(self.collapse_btn)
         top_bar.addWidget(self.close_btn)
         container_layout.addLayout(top_bar)
 
@@ -420,7 +550,6 @@ class FloatingHandwritingKeyboard(QWidget):
         self.cand_container.setSpacing(6)
         bottom_bar.addLayout(self.cand_container, 1)
 
-        # Visible, drag-enabled corner grip
         self.resize_grip = ResizeCornerGrip(self)
         bottom_bar.addWidget(self.resize_grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
 
@@ -435,16 +564,19 @@ class FloatingHandwritingKeyboard(QWidget):
         self.enter_btn.clicked.connect(lambda: send_vk_key(VK_RETURN))
 
     def init_tray_icon(self):
-        """Creates a System Tray icon near the Windows clock so the pad is always accessible."""
         pixmap = QPixmap(16, 16)
         pixmap.fill(QColor("#38bdf8"))
         self.tray_icon = QSystemTrayIcon(QIcon(pixmap), self)
         self.tray_icon.setToolTip("Handwriting Keyboard")
 
         tray_menu = QMenu()
-        show_action = QAction("Show / Restore Keyboard", self)
-        show_action.triggered.connect(self.restore_window)
+        show_action = QAction("Show Keyboard", self)
+        show_action.triggered.connect(self.expand_from_bubble)
         tray_menu.addAction(show_action)
+
+        bubble_action = QAction("Show Pen Bubble", self)
+        bubble_action.triggered.connect(self.collapse_to_bubble)
+        tray_menu.addAction(bubble_action)
 
         toggle_lang_action = QAction("Toggle Language (Hindi / English)", self)
         toggle_lang_action.triggered.connect(self.toggle_language)
@@ -456,19 +588,7 @@ class FloatingHandwritingKeyboard(QWidget):
         tray_menu.addAction(quit_action)
 
         self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
-
-    def restore_window(self):
-        self.showNormal()
-        self.activateWindow()
-
-    def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            if self.isVisible() and not self.isMinimized():
-                self.hide()
-            else:
-                self.restore_window()
 
     def toggle_language(self):
         if self.current_lang == "hi":
